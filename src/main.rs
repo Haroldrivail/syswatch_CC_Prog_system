@@ -301,3 +301,158 @@ fn format_response(snapshot: &SystemSnapshot, command: &str) -> String {
         _ => format!("Commande inconnue : '{}'. Tape 'help'.\n", command.trim()),
     }
 }
+
+// =============================================================================
+// ÉTAPE 4 — Serveur TCP multi-threadé
+// Concepts : TcpListener, TcpStream, thread::spawn, Arc<Mutex<T>>
+// =============================================================================
+
+/// Gère un client TCP dans son propre thread.
+/// Protocole :
+///   1. Le serveur envoie « TOKEN: »
+///   2. Le client répond avec le token (AUTH_TOKEN)
+///   3. Si correct → boucle de commandes ; sinon → UNAUTHORIZED et fermeture
+///   4. Chaque réponse est terminée par le marqueur « \nEND\n »
+fn handle_client(mut stream: TcpStream, snapshot: Arc<Mutex<SystemSnapshot>>) {
+    let peer = stream
+        .peer_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|_| "inconnu".to_string());
+    log_event(&format!("[+] Connexion de {}", peer));
+
+    // ── Authentification ──────────────────────────────────────────────────────
+    let _ = stream.write_all(b"TOKEN: ");
+
+    let mut reader = BufReader::new(stream.try_clone().expect("Impossible de cloner le stream"));
+    let mut token_line = String::new();
+
+    if reader.read_line(&mut token_line).is_err() || token_line.trim() != AUTH_TOKEN {
+        let _ = stream.write_all(b"UNAUTHORIZED\n");
+        log_event(&format!("[!] Acces refuse depuis {}", peer));
+        return; // fermeture automatique du stream en fin de portée
+    }
+
+    let _ = stream.write_all(b"OK\n");
+    log_event(&format!("[OK] Authentifie : {}", peer));
+
+    // Bannière de bienvenue
+    let banner = concat!(
+        "╔══════════════════════════════════╗\n",
+        "║   SysWatch v1.0 — ENSPD 2026     ║\n",
+        "║   Tape 'help' pour les commandes ║\n",
+        "╚══════════════════════════════════╝\n",
+    );
+    let _ = stream.write_all(banner.as_bytes());
+    let _ = stream.write_all(b"\nEND\n");
+
+    // ── Boucle de commandes ───────────────────────────────────────────────────
+    for line in reader.lines() {
+        match line {
+            Ok(cmd) => {
+                let cmd = cmd.trim().to_string();
+                log_event(&format!("[{}] commande : '{}'", peer, cmd));
+
+                // Déconnexion propre
+                if cmd.eq_ignore_ascii_case("quit") || cmd.eq_ignore_ascii_case("exit") {
+                    let _ = stream.write_all(b"Au revoir !\n\nEND\n");
+                    break;
+                }
+
+                // Lecture thread-safe du snapshot partagé
+                let response = {
+                    let snap = snapshot.lock().unwrap();
+                    format_response(&snap, &cmd)
+                };
+
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.write_all(b"\nEND\n"); // marqueur de fin de réponse
+            }
+            Err(_) => break, // déconnexion brutale
+        }
+    }
+
+    log_event(&format!("[-] Deconnexion de {}", peer));
+}
+
+/// Thread de rafraîchissement : met à jour le snapshot partagé toutes les 5 s.
+fn snapshot_refresher(snapshot: Arc<Mutex<SystemSnapshot>>) {
+    loop {
+        thread::sleep(Duration::from_secs(5));
+        match collect_snapshot() {
+            Ok(new_snap) => {
+                let mut snap = snapshot.lock().unwrap();
+                *snap = new_snap;
+                log_event("[refresh] Metriques mises a jour");
+            }
+            Err(e) => eprintln!("[refresh] Erreur : {}", e),
+        }
+    }
+}
+
+// =============================================================================
+// ÉTAPE 5 — Journalisation fichier (bonus)
+// Concepts : OpenOptions, mode append, std::io::Write
+// =============================================================================
+
+/// Écrit un événement horodaté sur stdout ET dans le fichier `syswatch.log`.
+/// L'écriture fichier est best-effort : une erreur d'I/O est silencieusement ignorée.
+fn log_event(message: &str) {
+    let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let line = format!("[{}] {}\n", timestamp, message);
+
+    // Affichage console (flush explicite : stdout est bufferisé dans Docker)
+    print!("{}", line);
+    let _ = std::io::stdout().flush();
+
+    // Écriture en mode append dans le fichier journal
+    if let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("syswatch.log")
+    {
+        let _ = file.write_all(line.as_bytes());
+    }
+}
+
+// =============================================================================
+// POINT D'ENTRÉE
+// =============================================================================
+
+fn main() {
+    println!("SysWatch démarrage...");
+
+    // ── Collecte initiale ─────────────────────────────────────────────────────
+    let initial = collect_snapshot().expect("Impossible de collecter les métriques initiales");
+    println!("Métriques initiales :\n{}", initial);
+    log_event("Demarrage SysWatch");
+
+    // Snapshot partagé via Arc<Mutex<T>> entre tous les threads
+    let shared_snapshot = Arc::new(Mutex::new(initial));
+
+    // ── Thread de rafraîchissement automatique ────────────────────────────────
+    {
+        let snap_clone = Arc::clone(&shared_snapshot);
+        thread::spawn(move || snapshot_refresher(snap_clone));
+    }
+
+    // ── Serveur TCP ───────────────────────────────────────────────────────────
+    let listener =
+        TcpListener::bind("0.0.0.0:7878").expect("Impossible de bind le port 7878");
+
+    log_event("Serveur TCP en ecoute sur 0.0.0.0:7878");
+    println!("Connecte-toi avec :");
+    println!("  telnet localhost 7878");
+    println!("  nc localhost 7878          (WSL / Git Bash)");
+    println!("Ctrl+C pour arrêter.\n");
+
+    // Boucle d'acceptation : chaque connexion → thread dédié
+    for stream in listener.incoming() {
+        match stream {
+            Ok(stream) => {
+                let snap_clone = Arc::clone(&shared_snapshot);
+                thread::spawn(move || handle_client(stream, snap_clone));
+            }
+            Err(e) => eprintln!("Erreur connexion entrante : {}", e),
+        }
+    }
+}
